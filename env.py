@@ -15,11 +15,11 @@ _log.setLevel(logging.INFO)
 CREATE_NO_WINDOW = 134217728
 
 CONFIG_PATH = "config.toml"
-FRONTEND_PATH = os.path.join(os.path.dirname(__file__), "pwa")
+FRONTEND_PATH = os.path.join(os.path.dirname(__file__), "public")
 if hasattr(sys, '_MEIPASS'):
     sys.stdout = open(os.devnull, 'w')
     CONFIG_PATH = os.path.join(sys._MEIPASS, CONFIG_PATH)
-    FRONTEND_PATH = os.path.join(sys._MEIPASS, "pwa")
+    FRONTEND_PATH = os.path.join(sys._MEIPASS, "public")
 
 if sys.platform == 'win32':
     OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Local", "ArcherLink")
