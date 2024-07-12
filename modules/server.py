@@ -7,26 +7,18 @@ import sys
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi_socketio import SocketManager
 
 from env import *
-from modules.mov.mov_cv2 import MovRecorder
 from modules.runpwa import open_as_pwa
 
-if VIDEO_PROVIDER == 'av':
-    if IMAGE_PROVIDER == 'pillow':
-        from modules.rtsp.av_pil import RTSPClient
-    elif IMAGE_PROVIDER == 'cv2':
-        from modules.rtsp.av_cv2 import RTSPClient
-    else:
-        raise ImportError("Wrong image provider for PyAV backend")
-elif VIDEO_PROVIDER == 'cv2' and IMAGE_PROVIDER == 'cv2':
-    from modules.rtsp.cv2 import RTSPClient
-else:
-    raise ImportError("Wrong image provider for cv2 backend")
+from modules.rtsp.cv2 import RTSPClient
+from modules.mov.cv2 import MovRecorder
 
 # origins = [
 #     "http://localhost:3000",  # Replace with your frontend app's URL
@@ -79,23 +71,24 @@ sio = SocketManager(
 RTSP = RTSPClient(TCP_IP, TCP_PORT, RTSP_URI, AV_OPTIONS)
 MOV = MovRecorder(RTSP, lambda x: x)
 
-CONNECTIONS_COUNT = 0
-
 clients_tasks = {}
 
 
 async def frame_emitter(sid):
     while True:
-        frame = RTSP.webframe
+        webframe = RTSP.webframe
+
+        frame = base64.b64encode(webframe).decode('utf-8') if webframe else None
+
         await sio.emit("frame", {
             "wifi": True,
             "stream": {
-                "frame": base64.b64encode(frame).decode('utf-8') if frame else None,
+                "frame": frame,
                 "state": RTSP.status.name,
-                "error": None
+                "error": RTSP.status == RTSP.status.Error
             },
             "recording": {
-                "state": False
+                "state": MOV.recording
             }
         }, to=sid)
         await asyncio.sleep(1 / RTSP.fps)
@@ -114,29 +107,60 @@ async def handle_disconnect(sid):
         task = clients_tasks.pop(sid)
         task.cancel()
 
+    if len(clients_tasks) <= 0:
+        await RTSP.stop()
+        uvicorn_server.should_exit = True
+        # uvicorn_server.force_exit()
+
 
 @sio.on("makeShot")
 async def handleMakeShot(sid, *args, **kwargs):
     try:
-        if RTSP.frame:
+        if RTSP.frame is not None:
             filepath = await get_output_filename()
             await RTSP.shot(filepath)
-            sio.emit('photo', {'filename': filepath})
+            await sio.emit('photo', {'filename': filepath})
         else:
-            sio.emit('photo', {'error': 'No frame available'})
-    except:
-        sio.emit('photo', {'error': 'Internal server error'})
+            raise IOError("No frame available")
+    except Exception as err:
+        await sio.emit('photo', {'error': err.__str__()})
 
 
 @sio.on("openMedia")
 async def handleOpenMedia(sid, *args, **kwargs):
-    print('handle open media')
-    await open_output_dir()
+    try:
+        await open_output_dir()
+    except Exception as err:
+        await sio.emit('photo', {'error': err.__str__()})
 
 
 @sio.on("toggleRecord")
 async def handleToggleRecord(sid, *args, **kwargs):
-    print('handle toggle record')
+    try:
+        if RTSP.frame is not None and RTSP.status == RTSP.Status.Running and not MOV.recording:
+            output_filename = await get_output_filename()
+            await MOV.start_async_recording(output_filename)
+            await sio.emit('record', {'msg': "Recording started"})
+        elif MOV.recording:
+            output_filename, err = await MOV.stop_recording()
+            if err is not None:
+                raise IOError(err)
+            await sio.emit('record', {'filename': output_filename})
+    except Exception as err:
+        await sio.emit('record', {'error': err.__str__()})
+
+
+@app.post("/api/server/stop")
+async def stop_server():
+    try:
+        await asyncio.sleep(1)
+        if len(clients_tasks) <= 0:
+            logging.info("Stop request from client")
+            await RTSP.stop()
+            uvicorn_server.should_exit = True
+            return JSONResponse({})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 async def check_port_available(host, port):

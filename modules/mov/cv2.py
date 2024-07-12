@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import cv2
-import numpy as np
+
 
 _log = logging.getLogger('Recorder')
 _log.setLevel(logging.DEBUG)
