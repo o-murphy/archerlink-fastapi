@@ -6,45 +6,40 @@ import socket
 import sys
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.requests import Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.websockets import WebSocketDisconnect
+from fastapi_socketio import SocketManager
 
 from env import *
-from modules.check_wifi import is_wifi_connected
-from modules.control import websocket as control_websocket
-from modules.mov.mov_cv2 import MovRecorder
 from modules.runpwa import open_as_pwa
 
-if VIDEO_PROVIDER == 'av':
-    if IMAGE_PROVIDER == 'pillow':
-        from modules.rtsp.av_pil import RTSPClient
-    elif IMAGE_PROVIDER == 'cv2':
-        from modules.rtsp.av_cv2 import RTSPClient
-    else:
-        raise ImportError("Wrong image provider for PyAV backend")
-elif VIDEO_PROVIDER == 'cv2' and IMAGE_PROVIDER == 'cv2':
-    from modules.rtsp.cv2 import RTSPClient
-else:
-    raise ImportError("Wrong image provider for cv2 backend")
+from modules.rtsp.cv2 import RTSPClient
+from modules.mov.cv2 import MovRecorder
 
-origins = [
-    "http://localhost:3000",  # Replace with your frontend app's URL
-    "http://localhost:8081",  # Replace with your frontend app's URL
-    "http://127.0.0.1:3000",  # Example origin, replace as necessary
-    "http://127.0.0.1:8081",  # Example origin, replace as necessary
-    "http://localhost:15010",  # Example origin, replace as necessary
-    "http://127.0.0.1:15010",  # Example origin, replace as necessary
-]
+# origins = [
+#     "http://localhost:3000",  # Replace with your frontend app's URL
+#     "http://localhost:8081",  # Replace with your frontend app's URL
+#     "ws://127.0.0.1:8081",  # Example origin, replace as necessary
+#     "ws://127.0.0.1:15010",  # Example origin, replace as necessary
+#     "ws://localhost:8081",  # Example origin, replace as necessary
+#     "ws://localhost:15010",  # Example origin, replace as necessary
+#     "http://127.0.0.1:3000",  # Example origin, replace as necessary
+#     "http://127.0.0.1:8081",  # Example origin, replace as necessary
+#     "http://localhost:15010",  # Example origin, replace as necessary
+#     "http://127.0.0.1:15010",  # Example origin, replace as necessary
+# ]
+
+origins = ["*"]
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # List of allowed origins
+    allow_origins=["*"],  # List of allowed origins
     allow_credentials=True,
     allow_methods=["*"],  # List of allowed methods, e.g., ["GET", "POST"]
     allow_headers=["*"],  # List of allowed headers, e.g., ["Content-Type"]
@@ -55,11 +50,6 @@ app.mount("/static", StaticFiles(directory=FRONTEND_PATH), name="static")
 
 app.mount("/_expo", StaticFiles(directory=os.path.join(FRONTEND_PATH, "_expo")), name="_expo")
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_PATH, "assets")), name="assets")
-
-RTSP = RTSPClient(TCP_IP, TCP_PORT, RTSP_URI, AV_OPTIONS)
-MOV = MovRecorder(RTSP, lambda x: x)
-
-CONNECTIONS_COUNT = 0
 
 
 # Serve the index.html file at the root URL
@@ -73,145 +63,104 @@ async def serve_root():
     return FileResponse(os.path.join(FRONTEND_PATH, "favicon.ico"))
 
 
-@app.post("/api/media")
-async def media(request: Request):
-    body = await request.json()
-    filename = body.get("filename", None)
-    if filename:
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        if not os.path.exists(filepath):
-            raise HTTPException(status_code=400, detail="File does not exist")
+sio = SocketManager(
+    app=app,
+    socketio_path="/ws/socket.io",
+)
 
-        try:
-            await open_file_path(filepath)
-            return JSONResponse({"status": "ok"})
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
-    else:
-        if not os.path.exists(OUTPUT_DIR):
-            raise HTTPException(status_code=400, detail="Media dir not exist")
+RTSP = RTSPClient(TCP_IP, TCP_PORT, RTSP_URI, AV_OPTIONS)
+MOV = MovRecorder(RTSP, lambda x: x)
+
+clients_tasks = {}
+
+
+async def frame_emitter(sid):
+    while True:
+        webframe = RTSP.webframe
+
+        frame = base64.b64encode(webframe).decode('utf-8') if webframe else None
+
+        await sio.emit("frame", {
+            "wifi": True,
+            "stream": {
+                "frame": frame,
+                "state": RTSP.status.name,
+                "error": RTSP.status == RTSP.status.Error
+            },
+            "recording": {
+                "state": MOV.recording
+            }
+        }, to=sid)
+        await asyncio.sleep(1 / RTSP.fps)
+
+
+@sio.on("connect")
+async def handle_connect(sid, *args, **kwargs):
+    print("Connected", sid)
+    clients_tasks[sid] = sio.start_background_task(frame_emitter, sid)
+
+
+@sio.on("disconnect")
+async def handle_disconnect(sid):
+    print("Disconnected", sid)
+    if sid in clients_tasks:
+        task = clients_tasks.pop(sid)
+        task.cancel()
+
+    if len(clients_tasks) <= 0:
+        await RTSP.stop()
+        uvicorn_server.should_exit = True
+        # uvicorn_server.force_exit()
+
+
+@sio.on("makeShot")
+async def handleMakeShot(sid, *args, **kwargs):
+    try:
+        if RTSP.frame is not None:
+            filepath = await get_output_filename()
+            await RTSP.shot(filepath)
+            await sio.emit('photo', {'filename': filepath})
+        else:
+            raise IOError("No frame available")
+    except Exception as err:
+        await sio.emit('photo', {'error': err.__str__()})
+
+
+@sio.on("openMedia")
+async def handleOpenMedia(sid, *args, **kwargs):
+    try:
         await open_output_dir()
-        return JSONResponse({"status": "ok"})
+    except Exception as err:
+        await sio.emit('photo', {'error': err.__str__()})
+
+
+@sio.on("toggleRecord")
+async def handleToggleRecord(sid, *args, **kwargs):
+    try:
+        if RTSP.frame is not None and RTSP.status == RTSP.Status.Running and not MOV.recording:
+            output_filename = await get_output_filename()
+            await MOV.start_async_recording(output_filename)
+            await sio.emit('record', {'msg': "Recording started"})
+        elif MOV.recording:
+            output_filename, err = await MOV.stop_recording()
+            if err is not None:
+                raise IOError(err)
+            await sio.emit('record', {'filename': output_filename})
+    except Exception as err:
+        await sio.emit('record', {'error': err.__str__()})
 
 
 @app.post("/api/server/stop")
 async def stop_server():
     try:
         await asyncio.sleep(1)
-        if CONNECTIONS_COUNT <= 0:
+        if len(clients_tasks) <= 0:
             logging.info("Stop request from client")
             await RTSP.stop()
             uvicorn_server.should_exit = True
             return JSONResponse({})
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-
-# @app.post("/api/server/wifi")
-# async def is_wifi_connected():
-#     return JSONResponse({"status": is_wifi_connected()})
-
-
-@app.post("/api/photo")
-async def take_photo():
-    try:
-        filename = await RTSP.shot(await get_output_filename())
-        if filename is not None:
-            return JSONResponse({"filename": filename})
-        raise HTTPException(status_code=400, detail="Can't take a stream")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@app.post("/api/record")
-async def toggle_record():
-    if not MOV.recording:
-        if RTSP.status == RTSP.Status.Running:
-            filename = await get_output_filename()
-            await MOV.start_async_recording(filename)
-            return JSONResponse({})
-        raise HTTPException(status_code=400, detail='Stream not running')
-    filename, err = await MOV.stop_recording()
-    state = "running" if MOV.recording else "stopped"
-    response_body = {
-        "state": state,
-        "error": MOV._error,
-        "filename": filename
-    }
-    MOV._error = None
-    return JSONResponse(response_body)
-
-
-@app.post("/api/record/state")
-async def record_state():
-    state = "running" if MOV.recording else "stopped"
-    response_body = {
-        "state": state,
-        "error": MOV._error,
-        "filename": MOV.filename
-    }
-    return JSONResponse(response_body)
-
-
-@app.post("/api/control")
-async def control_device(request: Request):
-    data = await request.json()
-    if (action := data.get("action", None)) is None:
-        raise HTTPException(400, detail='Invalid action')
-
-    actions = {
-        'zoom': control_websocket.change_zoom,
-        'agc': control_websocket.change_agc,
-        'scheme': control_websocket.change_color_scheme,
-        'ffc': control_websocket.send_trigger_ffc_command
-    }
-
-    if (call := actions.get(action, None)) is None:
-        raise HTTPException(400, detail='Invalid action')
-    await call()
-    return JSONResponse({}, 200)
-
-
-async def get_frames(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        frame = RTSP.webframe
-        if frame is not None:
-            b64_frame = base64.b64encode(frame).decode('utf-8')
-            await websocket.send_json({'image': b64_frame})
-            await asyncio.sleep(1 / RTSP.fps)
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    global CONNECTIONS_COUNT
-    await websocket.accept()
-    try:
-        CONNECTIONS_COUNT += 1
-        while True:
-            frame = RTSP.webframe
-            if frame is not None:
-                b64_frame = base64.b64encode(frame).decode('utf-8')
-                await websocket.send_json({
-                    'image': b64_frame,
-                    "error": None,
-                    "is_wifi": True
-                })
-                await asyncio.sleep(1 / RTSP.fps)
-            else:
-                await websocket.send_json({
-                    'image': None,
-                    "error": "No frame",
-                    "is_wifi": is_wifi_connected()
-                })
-                await asyncio.sleep(0.5)
-    except WebSocketDisconnect:
-        logging.info("Client disconnected")
-        CONNECTIONS_COUNT -= 1
-        if CONNECTIONS_COUNT <= 0:
-            await RTSP.stop()
-            uvicorn_server.should_exit = True
-            # uvicorn_server.force_exit()
 
 
 async def check_port_available(host, port):
@@ -236,6 +185,7 @@ def find_free_port():
 
 async def run():
     port = CFG['uvicorn'].get('port', find_free_port())
+    # port = CFG['uvicorn'].get('port', 15010)
     host = CFG['uvicorn'].get('host', '127.0.0.1')
     pwa_coro = open_as_pwa(f"{host}:{port}")
 
@@ -252,4 +202,6 @@ async def run():
     uvicorn_server = uvicorn.Server(config)
     rtsp_coro = RTSP.run_in_executor()
     serv_coro = uvicorn_server.serve()
-    await asyncio.gather(rtsp_coro, serv_coro, pwa_coro)
+    await asyncio.gather(
+        rtsp_coro,
+        serv_coro, pwa_coro)
