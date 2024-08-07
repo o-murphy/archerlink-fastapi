@@ -5,6 +5,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 hiddenimports=collect_submodules('uvicorn')
 hiddenimports += [
+    'pywebview',
     'pywintypes',
     'pythoncom',
     'pywin',
@@ -44,7 +45,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='ArcherLinkWebView-v0.1.2',
+    name='ArcherLinkWebView-v0.1.3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

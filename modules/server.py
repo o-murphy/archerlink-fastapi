@@ -15,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi_socketio import SocketManager
 
 from env import *
-from modules.runpwa import open_as_pwa
 
 from modules.rtsp.cv2 import RTSPClient
 from modules.mov.cv2 import MovRecorder
@@ -183,12 +182,7 @@ def find_free_port():
     return port
 
 
-async def run():
-    port = CFG['uvicorn'].get('port', find_free_port())
-    # port = CFG['uvicorn'].get('port', 15010)
-    host = CFG['uvicorn'].get('host', '127.0.0.1')
-    pwa_coro = open_as_pwa(f"{host}:{port}")
-
+async def run_server(host, port):
     config = uvicorn.Config(
         app, host=host, port=port
     )
@@ -196,7 +190,6 @@ async def run():
 
     if not await check_port_available(host, port):
         logging.info(f"Port {port} is already in use. Please use a different port.")
-        await pwa_coro
         sys.exit(1)
 
     uvicorn_server = uvicorn.Server(config)
@@ -204,4 +197,11 @@ async def run():
     serv_coro = uvicorn_server.serve()
     await asyncio.gather(
         rtsp_coro,
-        serv_coro, pwa_coro)
+        serv_coro,
+    )
+
+
+def run(host, port):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_server(host, port))
