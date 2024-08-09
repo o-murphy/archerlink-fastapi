@@ -16,6 +16,7 @@ def get_os_info():
 
 def get_webview_renderer_code():
     os_name, os_version, os_release = get_os_info()
+    print(os_name, os_version, os_release)
     if os_name == 'Windows':
         if int(os_release) >= 10:
             renderer = 'edgechromium'
@@ -82,12 +83,9 @@ def get_system_browser():
 
 def run_in_system_webview(code, url):
     import webview
-    # To pass custom settings to CEF, import and update settings dict
-    from webview.platforms.cef import browser_settings, settings
-
-    settings.update({'persist_session_cookies': True})
+    print("Running webview")
     window = webview.create_window('ArcherLink', url=f'http://{url}')
-    webview.start(debug=False)
+    webview.start(gui=code, debug=False)
     return window
 
 
@@ -109,7 +107,8 @@ def open(url):
     try:
         code = get_webview_renderer_code()
         run_in_system_webview(code, url)
-    except Exception:
+    except Exception as e:
+        print(e)
         browser_path = get_system_browser()
         run_in_webbrowser(browser_path, url)
 
