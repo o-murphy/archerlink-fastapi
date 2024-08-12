@@ -18,7 +18,7 @@ def get_webview_renderer_code():
     os_name, os_version, os_release = get_os_info()
     print(os_name, os_version, os_release)
     if os_name == 'Windows':
-        if int(os_release) >= 10:
+        if int(os_release) >= 8:
             renderer = 'edgechromium'
         elif int(os_release) >= 7:
             renderer = 'qt'
